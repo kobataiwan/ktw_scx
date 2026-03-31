@@ -27,7 +27,10 @@ use std::time::Instant;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use clap::CommandFactory;
 use clap::Parser;
+use clap_complete::generate;
+use clap_complete::Shell;
 use libbpf_rs::MapCore as _;
 use libbpf_rs::OpenObject;
 use libbpf_rs::ProgramInput;
@@ -57,7 +60,6 @@ use stats::Metrics;
 const SCHEDULER_NAME: &str = "scx_mitosis";
 const MAX_CELLS: usize = bpf_intf::consts_MAX_CELLS as usize;
 const NR_CSTATS: usize = bpf_intf::cell_stat_idx_NR_CSTATS as usize;
-
 /// Epoll token for inotify events (cgroup creation/destruction)
 const INOTIFY_TOKEN: u64 = 1;
 /// Epoll token for stats request wakeups
@@ -166,6 +168,10 @@ struct Opts {
     #[clap(long, action = clap::ArgAction::SetTrue)]
     enable_borrowing: bool,
 
+    /// Use lockless scx_bpf_dsq_peek() instead of the default iterator-based peek.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    use_lockless_peek: bool,
+
     /// Enable demand-based CPU rebalancing between cells.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     enable_rebalancing: bool,
@@ -184,6 +190,9 @@ struct Opts {
 
     #[clap(flatten, next_help_heading = "Libbpf Options")]
     pub libbpf: LibbpfOpts,
+    /// Generate shell completions for the given shell and exit.
+    #[clap(long, value_name = "SHELL", hide = true)]
+    completions: Option<Shell>,
 }
 
 // The subset of cstats we care about.
@@ -340,6 +349,7 @@ impl<'a> Scheduler<'a> {
         rodata.userspace_managed_cell_mode = opts.cell_parent_cgroup.is_some();
 
         rodata.enable_borrowing = opts.enable_borrowing;
+        rodata.use_lockless_peek = opts.use_lockless_peek;
 
         match *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP {
             0 => info!("Kernel does not support queued wakeup optimization."),
@@ -1049,7 +1059,7 @@ impl<'a> Scheduler<'a> {
             // Lent time: non-owner cell tasks running on this CPU
             let total_on_cpu: u64 = cpu_ctx.running_ns.iter().sum();
             let owner_on_cpu = cpu_ctx.running_ns[owner];
-            lent_ns[owner] += total_on_cpu - owner_on_cpu;
+            lent_ns[owner] += total_on_cpu.saturating_sub(owner_on_cpu);
         }
 
         // Compute deltas since last collection interval
@@ -1062,9 +1072,9 @@ impl<'a> Scheduler<'a> {
 
         for cell in 0..MAX_CELLS {
             let delta_running =
-                total_running_ns[cell].wrapping_sub(self.prev_cell_running_ns[cell]);
-            let delta_on_own = on_own_ns[cell].wrapping_sub(self.prev_cell_own_ns[cell]);
-            let delta_lent = lent_ns[cell].wrapping_sub(self.prev_cell_lent_ns[cell]);
+                total_running_ns[cell].saturating_sub(self.prev_cell_running_ns[cell]);
+            let delta_on_own = on_own_ns[cell].saturating_sub(self.prev_cell_own_ns[cell]);
+            let delta_lent = lent_ns[cell].saturating_sub(self.prev_cell_lent_ns[cell]);
 
             self.prev_cell_running_ns[cell] = total_running_ns[cell];
             self.prev_cell_own_ns[cell] = on_own_ns[cell];
@@ -1122,10 +1132,10 @@ impl<'a> Scheduler<'a> {
                     .smoothed_util_pct = self.smoothed_util[cell];
             }
 
-            global_running_delta += delta_running;
-            global_borrowed_delta += delta_borrowed;
-            global_lent_delta += delta_lent;
-            global_capacity += capacity;
+            global_running_delta = global_running_delta.saturating_add(delta_running);
+            global_borrowed_delta = global_borrowed_delta.saturating_add(delta_borrowed);
+            global_lent_delta = global_lent_delta.saturating_add(delta_lent);
+            global_capacity = global_capacity.saturating_add(capacity);
         }
 
         let global_util_pct = if global_capacity > 0 {
@@ -1290,6 +1300,16 @@ fn read_cpu_ctxs(skel: &BpfSkel) -> Result<Vec<bpf_intf::cpu_ctx>> {
 
 #[clap_main::clap_main]
 fn main(opts: Opts) -> Result<()> {
+    if let Some(shell) = opts.completions {
+        generate(
+            shell,
+            &mut Opts::command(),
+            "scx_mitosis",
+            &mut std::io::stdout(),
+        );
+        return Ok(());
+    }
+
     if opts.version {
         println!(
             "scx_mitosis {}",
